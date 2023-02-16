@@ -17,6 +17,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Remargin Training.')
     parser.add_argument('--temperature', type=float, default=0.05,
                     help='temperature for remargin')
+    parser.add_argument('--dataset', type=str, default='CIFAR10', help='CIFAR10 or CIFAR100')
+    parser.add_argument('--train_steps', type=int, default=7, help='attack steps for training')
+    parser.add_argument('--test_steps', type=int, default=20, help='attack steps for testing')
         
     args = parser.parse_args()
     return args
@@ -25,11 +28,11 @@ args = parse_args()
 
 learning_rate = 0.1
 epsilon = 0.0314
-k = 7
+# k = 7
 alpha = 0.00784
 
 temperature = args.temperature
-file_name = 'pgd_remargin_tem'+str(temperature)
+file_name = args.dataset+'pgd_remargin_tem'+str(temperature)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -47,8 +50,12 @@ def loadEmbeddings(filename):
     return model
 
 # Get the similarity score between labels
-gembs = loadEmbeddings("./data/glove.840B.300d.top25k.txt")
-CIFAR_label = ['plane','auto','bird','cat', 'deer','dog', 'frog','horse','ship','truck']
+gembs = loadEmbeddings(os.path.expanduser('~')+"/dataset/glove.840B.300d.top25k.txt")
+if args.dataset == "CIFAR10":
+    CIFAR_label = ['plane','auto','bird','cat', 'deer','dog', 'frog','horse','ship','truck']
+elif args.dataset == "CIFAR100":
+    CIFAR_label = torch.load("cifar100_label.pt")
+import ipdb; ipdb.set_trace()
 label_emb = torch.cat([torch.tensor(gembs[label]).view(1,-1) for label in CIFAR_label]).to(device)
 label_sim = label_emb @ label_emb.T
 label_sim = label_sim - torch.diag(torch.diag(label_sim))
@@ -65,8 +72,14 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-train_dataset = torchvision.datasets.CIFAR10(root='~/dataset', train=True, download=True, transform=transform_train)
-test_dataset = torchvision.datasets.CIFAR10(root='~/dataset', train=False, download=True, transform=transform_test)
+if args.dataset == "CIFAR10":
+    num_classes = 10
+    train_dataset = torchvision.datasets.CIFAR10(root='~/dataset', train=True, download=True, transform=transform_train)
+    test_dataset = torchvision.datasets.CIFAR10(root='~/dataset', train=False, download=True, transform=transform_test)
+elif args.dataset == "CIFAR100":
+    num_classes = 100
+    train_dataset = torchvision.datasets.CIFAR100(root='~/dataset', train=True, download=True, transform=transform_train)
+    test_dataset = torchvision.datasets.CIFAR100(root='~/dataset', train=False, download=True, transform=transform_test)
 
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=4)
@@ -76,10 +89,10 @@ class LinfPGDAttack(object):
     def __init__(self, model):
         self.model = model
 
-    def perturb(self, x_natural, y):
+    def perturb(self, x_natural, y, num_steps):
         x = x_natural.detach()
         x = x + torch.zeros_like(x).uniform_(-epsilon, epsilon)
-        for i in range(k):
+        for i in range(num_steps):
             x.requires_grad_()
             with torch.enable_grad():
                 logits = self.model(x)
@@ -90,15 +103,15 @@ class LinfPGDAttack(object):
             x = torch.clamp(x, 0, 1)
         return x
 
-def attack(x, y, model, adversary):
+def attack(x, y, model, adversary, num_steps):
     model_copied = copy.deepcopy(model)
     model_copied.eval()
     adversary.model = model_copied
-    adv = adversary.perturb(x, y)
+    adv = adversary.perturb(x, y, num_steps)
     return adv
 
 # Load Model
-net = resnet.ResNet18()
+net = resnet.ResNet18(num_classes)
 net = net.to(device)
 net = torch.nn.DataParallel(net)
 cudnn.benchmark = True
@@ -114,17 +127,9 @@ def RemarginLoss(logits, targets, temp=temperature):
 criterion = RemarginLoss
 optimizer = optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=0.0002)
 
-best_state = None
-best_epoch = 0
-best_benign_test = 0.0
-best_adv_test = 0.0
-
-train_acc_list = []
-test_robust_acc_list = []
-test_benign_acc_list = []
-
-train_loss_list = []
-test_adv_loss_list = []
+# best_state = None
+train_state = {'train_acc':[], 'test_robust_acc':[], 'test_benign_acc':[], 'train_loss':[], 'test_adv_loss':[], 
+                'best_epoch':0, 'best_benign_test':0.0, 'best_adv_test':0.0, 'best_state':None}
 def train(epoch):
     print('\n[ Train epoch: %d ]' % epoch)
     net.train()
@@ -157,14 +162,11 @@ def train(epoch):
 
     print('\nTotal adversarial train accuarcy:', 100. * correct / total)
     print('Total adversarial train loss:', train_loss/total)
-    train_acc_list.append(100. * correct / total)
-    train_loss_list.append(train_loss/total)
+    train_state['train_acc'].append(100. * correct / total)
+    train_state['train_loss'].append(train_loss/total)
 
 def test(epoch):
-    global best_state
-    global best_epoch
-    global best_benign_test
-    global best_adv_test
+    global train_state
     
     print('\n[ Test epoch: %d ]' % epoch)
     net.eval()
@@ -209,25 +211,25 @@ def test(epoch):
     print('Total adversarial test Accuarcy:', 100. * adv_correct / total)
     print('Total benign test loss:', benign_loss/total)
     print('Total adversarial test loss:', adv_loss/total)
-    test_benign_acc_list.append(100. * benign_correct / total)
-    test_robust_acc_list.append(100. * adv_correct / total)
-    test_adv_loss_list.append(adv_loss/total)
+    train_state["test_benign_acc"].append(100. * benign_correct / total)
+    train_state["test_robust_acc"].append(100. * adv_correct / total)
+    train_state["test_adv_loss"].append(adv_loss/total)
 
     if (100. * adv_correct / total) > best_adv_test:
-        best_epoch = epoch
-        best_state = {
+        train_state["best_epoch"] = epoch
+        train_state["best_state"] = {
             'net': net.state_dict()
         }
-        best_adv_test = 100. * adv_correct / total
-        best_benign_test = 100. * benign_correct / total
+        train_state["best_adv_test"] = 100. * adv_correct / total
+        train_state["best_benign_test"] = 100. * benign_correct / total
 
     if epoch % 10 == 0:
         state = {
             'net': net.state_dict()
         }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/' + file_name+'_epoch'+str(epoch)+'.pt')
+        if not os.path.isdir('../checkpoint'):
+            os.mkdir('../checkpoint')
+        torch.save(state, '../checkpoint/' + file_name+'_epoch'+str(epoch)+'.pt')
         print('Model Saved!')
 
 def adjust_learning_rate(optimizer, epoch):
@@ -246,22 +248,23 @@ for epoch in range(1, 201):
     test(epoch)
 print("Save Best Model at Epoch "+str(best_epoch)+"\tBenign Acc: "+str(best_benign_test)+"\tAdv Acc: "+str(best_adv_test))
 print('Remargin Loss with temperature '+str(temperature))
-if not os.path.isdir('./checkpoint'):
-    os.mkdir('./checkpoint')
-torch.save(best_state, './checkpoint/' + file_name+'best_epoch'+str(best_epoch)+'.pt')
+print("Save Best Model")
+if not os.path.isdir('../checkpoint'):
+    os.mkdir('../checkpoint')
+torch.save(train_state, '../checkpoint/' + file_name+'best_epoch'+str(best_epoch)+'.pt')
 
-import matplotlib.pyplot as plt
-plt.figure(1)
-plt.title('Remargin t='+str(temperature))
-plt.subplot(121)
-plt.gca().set_title('Acc vs Epoch')
-plt.plot(train_acc_list, label="train_acc")
-plt.plot(test_benign_acc_list, label='test_benign_acc')
-plt.plot(test_robust_acc_list, label='test_adv_acc')
-plt.legend()
-plt.subplot(122)
-plt.gca().set_title('Loss vs Epoch')
-plt.plot(train_loss_list, label='train_loss')
-plt.plot(test_adv_loss_list, label='test_loss')
-plt.legend()
-plt.savefig('./figures/'+file_name+'.png')
+# import matplotlib.pyplot as plt
+# plt.figure(1)
+# plt.title(args.dataset+'\tRemargin t='+str(temperature))
+# plt.subplot(121)
+# plt.gca().set_title('Acc vs Epoch')
+# plt.plot(train_acc_list, label="train_acc")
+# plt.plot(test_benign_acc_list, label='test_benign_acc')
+# plt.plot(test_robust_acc_list, label='test_adv_acc')
+# plt.legend()
+# plt.subplot(122)
+# plt.gca().set_title('Loss vs Epoch')
+# plt.plot(train_loss_list, label='train_loss')
+# plt.plot(test_adv_loss_list, label='test_loss')
+# plt.legend()
+# plt.savefig('./figures/'+file_name+'.png')
