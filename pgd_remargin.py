@@ -25,6 +25,7 @@ def parse_args():
     return args
 
 args = parse_args()
+print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
 
 learning_rate = 0.1
 epsilon = 0.0314
